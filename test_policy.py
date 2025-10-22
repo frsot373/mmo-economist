@@ -1,14 +1,16 @@
-import yaml
 import os
-import foundation
-import numpy as np
-import matplotlib.pyplot as plt
-import ray
 
-from experiments import tf_models
+import numpy as np
+import ray
+import yaml
+from experiments import torch_models  # noqa: F401
 from foundation.utils import plotting
 from foundation.utils.rllib_env_wrapper import RLlibEnvWrapper
-from ray.rllib.agents.ppo import PPOTrainer
+
+try:
+    from ray.rllib.agents.ppo import PPOTrainer  # type: ignore
+except ImportError:  # pragma: no cover
+    from ray.rllib.algorithms.ppo import PPO as PPOTrainer
 
 
 def generate_rollout_from_current_trainer_policy(
@@ -76,7 +78,7 @@ def generate_rollout_from_current_trainer_policy(
 
 
 
-ray.init(webui_host="127.0.0.1")
+ray.init(ignore_reinit_error=True)
 
 config_path = os.path.join('./experiments', "config_50_50.yaml")
 
@@ -129,8 +131,8 @@ trainer_config.update(
     }
 )
 trainer = PPOTrainer(env=RLlibEnvWrapper, config=trainer_config)
-# trainer._restore('ckpts/dir_ckpt_random-asy/t1/iter_399/checkpoint_400/checkpoint-400')
-trainer._restore('ckpts/dir_ckpt_random-asy/iter_60/checkpoint_61/checkpoint-61')
+# trainer.restore('ckpts/dir_ckpt_random-asy/t1/iter_399/checkpoint_400/checkpoint-400')
+trainer.restore('ckpts/dir_ckpt_random-asy/iter_60/checkpoint_61/checkpoint-61')
 
 # dense_logs = generate_rollout_from_current_trainer_policy(
 #     trainer,

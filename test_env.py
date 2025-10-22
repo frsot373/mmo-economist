@@ -1,14 +1,16 @@
-import yaml
 import os
-import foundation
-import numpy as np
-import matplotlib.pyplot as plt
-import ray
 
-from experiments import tf_models
+import numpy as np
+import ray
+import yaml
+from experiments import torch_models  # noqa: F401
 from foundation.utils import plotting
 from foundation.utils.rllib_env_wrapper import RLlibEnvWrapper
-from ray.rllib.agents.ppo import PPOTrainer
+
+try:
+    from ray.rllib.agents.ppo import PPOTrainer  # type: ignore
+except ImportError:  # pragma: no cover
+    from ray.rllib.algorithms.ppo import PPO as PPOTrainer
 
 
 def generate_rollout_from_current_trainer_policy(
@@ -83,7 +85,7 @@ def generate_rollout_from_current_trainer_policy(
 
 
 
-ray.init(webui_host="127.0.0.1")
+ray.init(ignore_reinit_error=True)
 
 
 # tmp
@@ -163,8 +165,8 @@ def init_trainer(args):
 
 
 # test_config='20'
-def save_logs(dense_logs,env_config,args):
-    os.mkdir(args.savedir)
+def save_logs(dense_logs, env_config, args):
+    os.makedirs(args.savedir, exist_ok=True)
 
     p1,p2,p3,p4=plotting.breakdown(dense_logs[0])
     p1.savefig(os.path.join(args.savedir, f'p1_{args.cfg[:10]}.png'))
@@ -179,7 +181,7 @@ if __name__ == "__main__":
     trainer,run_configuration=init_trainer(args)
 
     if args.restore != '':
-        trainer._restore(args.restore)
+        trainer.restore(args.restore)
 
     env_config = {
             "env_config_dict": run_configuration["env"],

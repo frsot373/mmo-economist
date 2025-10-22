@@ -87,8 +87,8 @@ agent_policy:
   lr: 0.0001
   lr_schedule: null
   model:
-    custom_model: keras_conv_lstm
-    custom_options:
+    custom_model: torch_conv_lstm
+    custom_model_config:
       fc_dim: 128
       idx_emb_dim: 4
       input_emb_vocab: 100
@@ -112,8 +112,8 @@ planner_policy:
   lr: 0.0001
   lr_schedule: null
   model:
-    custom_model: keras_conv_lstm
-    custom_options:
+    custom_model: torch_conv_lstm
+    custom_model_config:
       fc_dim: 256
       idx_emb_dim: 4
       input_emb_vocab: 100
@@ -128,30 +128,16 @@ planner_policy:
 trainer:
   batch_mode: truncate_episodes
   env_config: null
-  local_tf_session_args:
-    inter_op_parallelism_threads: 2
-    intra_op_parallelism_threads: 4
   metrics_smoothing_episodes: null
   multiagent: null
   no_done_at_end: false
   num_envs_per_worker: 1
   num_gpus: 0
-  num_gpus_per_worker: 0
   num_sgd_iter: 2
-  num_workers: 8 
+  num_workers: 8
   observation_filter: NoFilter
   rollout_fragment_length: 600
   seed: null
   sgd_minibatch_size: 2000
   shuffle_sequences: true
-  tf_session_args:
-    allow_soft_placement: true
-    device_count:
-      CPU: 4
-      GPU: 0
-    gpu_options:
-      allow_growth: true
-    inter_op_parallelism_threads: 2
-    intra_op_parallelism_threads: 4 
-    log_device_placement: false
   train_batch_size: 8000
