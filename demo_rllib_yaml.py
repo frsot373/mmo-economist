@@ -1,19 +1,46 @@
-import yaml
 import os
-import foundation
+
 import numpy as np
-import matplotlib.pyplot as plt
 import ray
-from ray import tune
-
-from experiments import tf_models
-from foundation.utils import plotting
+import yaml
+from experiments import torch_models  # noqa: F401
 from foundation.utils.rllib_env_wrapper import RLlibEnvWrapper
-from ray.rllib.agents.ppo import PPOTrainer
-# from ray.rllib.algorithms.ppo import PPO
-from datetime import datetime
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
 
-ray.init(webui_host='127.0.0.1')
+try:  # pragma: no cover - compatibility with older Ray versions
+    from ray.rllib.algorithms.ppo import PPO as PPOTrainer
+except ImportError:  # pragma: no cover
+    from ray.rllib.agents.ppo import PPOTrainer
+
+ray.init(ignore_reinit_error=True)
+
+
+class DemoCallbacks(DefaultCallbacks):
+    def on_episode_start(self, *, worker, base_env, policies, episode, **kwargs):
+        episode.user_data["res"] = []
+
+    def on_episode_step(self, *, worker, base_env, episode, **kwargs):
+        info = episode.last_info_for("p")
+        if info is None:
+            return
+        res = info.get("res")
+        if res is not None:
+            episode.user_data["res"].append(res)
+
+    def on_episode_end(self, *, worker, base_env, policies, episode, **kwargs):
+        results = episode.user_data.get("res", [])
+        if not results:
+            return
+        res = np.array(results)
+        idx = np.where(res[:, 0] > 0)[0]
+        if idx.size == 0:
+            return
+        equality_segments = np.split(res[:, 1], idx + 1)
+        equality_scores = [np.mean(seg) for seg in equality_segments if len(seg) > 0]
+        equality = float(np.mean(equality_scores)) if equality_scores else 0.0
+        episode.custom_metrics["profit"] = float(np.mean(res[idx, 0]))
+        episode.custom_metrics["equality"] = equality
+        episode.custom_metrics["capability"] = float(np.mean(res[idx, 2]))
 
 def parse_args():
     import argparse
@@ -26,33 +53,6 @@ def parse_args():
     parser.add_argument('--phase', type=int, default=1)# 1/2
     res =parser.parse_args()
     return res
-
-def on_episode_start(info):
-    info["episode"].user_data["res"] = []
-    # info["episode"].hist_data["res"] = []
-
-
-def on_episode_step(info):
-    # print(info['episode'].total_reward)
-
-    if info['episode'].last_info_for('p').get('res') is not None:
-        # if info['episode'].last_info_for('p').get('res')[0]>0:
-        info["episode"].user_data["res"].append(info['episode'].last_info_for('p')['res'])
-
-
-
-def on_episode_end(info):
-    episode = info["episode"]
-    res=np.array(episode.user_data["res"])
-    idx=np.where(res[:,0]>0)[0]
-    equality=np.split(res[:, 1], idx + 1)
-    equality=np.mean([np.mean(_) for _ in equality if len(_)>0])
-    # print(f'profit: {res[idx,0]}, equality: {equality}, capability: {res[idx,2]}')
-
-    info["episode"].custom_metrics["profit"] = np.mean(res[idx,0])
-    info["episode"].custom_metrics["equality"] = equality
-    info["episode"].custom_metrics["capability"] = np.mean(res[idx,2])
-    # info["episode"].hist_data["res"] = np.mean(episode.user_data["res"])
 
 def init_trainer(args):
 
@@ -114,14 +114,7 @@ def init_trainer(args):
         }
     )
 
-    trainer_config['callbacks']={
-        "on_episode_start": on_episode_start,
-        "on_episode_step": on_episode_step,
-        "on_episode_end": on_episode_end,
-        # "on_sample_end": on_sample_end,
-        # "on_postprocess_traj": on_postprocess_traj
-        # "on_train_result": on_train_result,
-                                 }
+    trainer_config['callbacks'] = DemoCallbacks
 
     exp_dir='runs/'
     log_dir=f"/phase_{args.phase}_{run_configuration['env']['adjustemt_type']}_{cfg_path[:9]}"
@@ -182,6 +175,6 @@ if __name__=="__main__":
     args=parse_args()
     trainer,save_dir=init_trainer(args)
     if args.restore!='':
-        trainer._restore(args.restore)
-        # trainer._restore('dir_ckpt_random-asy/iter_399/checkpoint_400/checkpoint-400')
+        trainer.restore(args.restore)
+        # trainer.restore('dir_ckpt_random-asy/iter_399/checkpoint_400/checkpoint-400')
     train(trainer,args,save_dir)

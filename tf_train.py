@@ -1,98 +1,75 @@
-import yaml
+import argparse
 import os
-import foundation
-import numpy as np
-import matplotlib.pyplot as plt
-import ray
-from ray import tune
-
-from experiments import tf_models
-from foundation.utils import plotting
-from foundation.utils.rllib_env_wrapper import RLlibEnvWrapper
-from ray.rllib.agents.ppo import PPOTrainer
-# from ray.rllib.algorithms.ppo import PPO
-from datetime import datetime
 import tempfile
-from ray.tune.logger import UnifiedLogger
-ray.init(webui_host='127.0.0.1')
-def custom_log_creator(custom_path, custom_str):
+import time
+from datetime import datetime
 
+import numpy as np
+import ray
+import yaml
+from experiments import torch_models  # noqa: F401
+from foundation.utils.rllib_env_wrapper import RLlibEnvWrapper
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.tune.logger import UnifiedLogger
+
+
+class MMOCallbacks(DefaultCallbacks):
+    def on_episode_start(self, *, worker, base_env, policies, episode, **kwargs):
+        episode.user_data["res"] = []
+
+    def on_episode_step(self, *, worker, base_env, episode, **kwargs):
+        info = episode.last_info_for("p")
+        if info is None:
+            return
+        res = info.get("res")
+        if res is not None:
+            episode.user_data["res"].append(res)
+
+    def on_episode_end(self, *, worker, base_env, policies, episode, **kwargs):
+        results = episode.user_data.get("res", [])
+        if not results:
+            return
+        res = np.array(results)
+        idx = np.where(res[:, 0] > 0)[0]
+        if idx.size == 0:
+            return
+        equality_segments = np.split(res[:, 1], idx + 1)
+        equality_scores = [np.mean(seg) for seg in equality_segments if len(seg) > 0]
+        equality = float(np.mean(equality_scores)) if equality_scores else 0.0
+        episode.custom_metrics["profit"] = float(res[idx[-1], 0])
+        episode.custom_metrics["equality"] = equality
+        episode.custom_metrics["capability"] = float(res[idx[-1], 2])
+        episode.custom_metrics["equXcap"] = float(np.mean(res[:, 1] * res[:, 2]))
+
+
+def custom_log_creator(custom_path: str, custom_str: str):
     timestr = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
-    logdir_prefix = "{}_{}".format(custom_str, timestr)
+    logdir_prefix = f"{custom_str}_{timestr}"
 
     def logger_creator(config):
-
-        if not os.path.exists(custom_path):
-            os.makedirs(custom_path)
+        os.makedirs(custom_path, exist_ok=True)
         logdir = tempfile.mkdtemp(prefix=logdir_prefix, dir=custom_path)
         return UnifiedLogger(config, logdir, loggers=None)
 
     return logger_creator
 
-def parse_args():
-    import argparse
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--adj', type=str, default='')# adjust type
-    parser.add_argument('--restore', type=str, default='')# restore ckpt path
-    parser.add_argument('--cfg', type=str, default='')# config_50_50.yaml
-    parser.add_argument('--num-iter', type=int, default=-1)# train iter
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--phase', type=int, default=1)# 1/2
-    res =parser.parse_args()
-    return res
-
-def on_episode_start(info):
-    info["episode"].user_data["res"] = []
-    # info["episode"].hist_data["res"] = []
+    parser.add_argument("--adj", type=str, default="", help="Adjustment type override")
+    parser.add_argument("--restore", type=str, default="", help="Checkpoint path to restore")
+    parser.add_argument("--cfg", type=str, default="", help="Experiment config name")
+    parser.add_argument("--num-iter", type=int, default=-1, help="Number of training iterations")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--phase", type=int, default=1)
+    return parser.parse_args()
 
 
-def on_episode_step(info):
-    # print(info['episode'].total_reward)
-
-    if info['episode'].last_info_for('p').get('res') is not None:
-        # if info['episode'].last_info_for('p').get('res')[0]>0:
-        info["episode"].user_data["res"].append(info['episode'].last_info_for('p')['res'])
-
-
-
-def on_episode_end(info):
-    episode = info["episode"]
-    res=np.array(episode.user_data["res"])
-    idx=np.where(res[:,0]>0)[0] #idx of planner action
-    equality=np.split(res[:, 1], idx + 1)
-    equality=np.mean([np.mean(_) for _ in equality if len(_)>0])
-    # print(f'profit: {res[idx,0]}, equality: {equality}, capability: {res[idx,2]}')
-
-    info["episode"].custom_metrics["profit"] = res[idx[-1],0]#np.mean(res[idx,0])
-    info["episode"].custom_metrics["equality"] = equality
-    info["episode"].custom_metrics["capability"] = res[idx[-1],2]#np.mean(res[idx,2])
-    info["episode"].custom_metrics["equXcap"] = np.mean(res[:,1]*res[:,2])
-    # info["episode"].hist_data["res"] = np.mean(episode.user_data["res"])
-
-def init_trainer(args):
-
-
-    #config_path = os.path.join('./experiments', "config_50_50.yaml")
-    # cfg_path='config_20_80.yaml'
-    cfg_path=args.cfg
-    config_path = os.path.join('./experiments', cfg_path+'.yaml')
-
-    with open(config_path, "r") as f:
-        run_configuration = yaml.safe_load(f)
-
-    trainer_config = run_configuration.get("trainer")
-
-
-    if args.adj!='':
-        run_configuration["env"]["adjustemt_type"]=args.adj
-    if args.phase==2:
-        run_configuration["general"]["train_planner"]=True
-    else:
-        run_configuration["general"]["train_planner"] = False
-    env_config = {
-        "env_config_dict": run_configuration.get("env"),
-        "num_envs_per_worker": trainer_config.get("num_envs_per_worker"),
-    }
+def build_trainer(
+    run_configuration: dict, env_config: dict, seed: int, logger_creator=None
+):
+    trainer_cfg = run_configuration.get("trainer", {})
 
     dummy_env = RLlibEnvWrapper(env_config, verbose=True)
 
@@ -108,101 +85,164 @@ def init_trainer(args):
         dummy_env.action_space_pl,
         run_configuration.get("planner_policy"),
     )
-
     policies = {"a": agent_policy_tuple, "p": planner_policy_tuple}
-    def policy_mapping_fun(i): return "a" if str(i).isdigit() else "p"
 
+    def policy_mapping_fun(agent_id):
+        return "a" if str(agent_id).isdigit() else "p"
 
-    if run_configuration["general"]["train_planner"]:
+    if run_configuration["general"].get("train_planner"):
         policies_to_train = ["a", "p"]
     else:
         policies_to_train = ["a"]
 
-    trainer_config.update(
-        {
-            "env_config": env_config,
-            "seed": args.seed,
-            "multiagent": {
-                "policies": policies,
-                "policies_to_train": policies_to_train,
-                "policy_mapping_fn": policy_mapping_fun,
-            },
-            "metrics_smoothing_episodes": trainer_config.get("num_workers")
-            * trainer_config.get("num_envs_per_worker"),
-        }
+    metrics_smoothing = trainer_cfg.get("metrics_smoothing_episodes")
+    if metrics_smoothing is None:
+        metrics_smoothing = (
+            trainer_cfg.get("num_workers", 0) * trainer_cfg.get("num_envs_per_worker", 1)
+        )
+
+    config_builder = (
+        PPOConfig()
+        .environment(env=RLlibEnvWrapper, env_config=env_config)
+        .framework("torch")
+        .seed(seed)
+        .rollouts(
+            num_rollout_workers=trainer_cfg.get("num_workers", 0),
+            num_envs_per_worker=trainer_cfg.get("num_envs_per_worker", 1),
+            rollout_fragment_length=trainer_cfg.get("rollout_fragment_length", 200),
+            batch_mode=trainer_cfg.get("batch_mode", "truncate_episodes"),
+            observation_filter=trainer_cfg.get("observation_filter", "NoFilter"),
+        )
+        .training(
+            train_batch_size=trainer_cfg.get("train_batch_size", 4000),
+            sgd_minibatch_size=trainer_cfg.get("sgd_minibatch_size", 128),
+            num_sgd_iter=trainer_cfg.get("num_sgd_iter", 10),
+            shuffle_sequences=trainer_cfg.get("shuffle_sequences", True),
+        )
+        .resources(num_gpus=trainer_cfg.get("num_gpus", 0))
+        .reporting(metrics_num_episodes_for_smoothing=metrics_smoothing)
+        .multi_agent(
+            policies=policies,
+            policies_to_train=policies_to_train,
+            policy_mapping_fn=policy_mapping_fun,
+        )
+        .callbacks(MMOCallbacks)
     )
 
-    trainer_config['callbacks']={
-        "on_episode_start": on_episode_start,
-        "on_episode_step": on_episode_step,
-        "on_episode_end": on_episode_end,
-        # "on_sample_end": on_sample_end,
-        # "on_postprocess_traj": on_postprocess_traj
-        # "on_train_result": on_train_result,
-                                 }
+    return config_builder.build(logger_creator=logger_creator)
 
-    exp_dir='runs/'
-    log_dir=f"/phase_{args.phase}_{run_configuration['env']['adjustemt_type']}_{cfg_path[:12]}"
-    save_dir=f"runs/phase_{args.phase}_{run_configuration['env']['adjustemt_type']}_seed_{args.seed}/{cfg_path[:12]}"
 
-    trainer = PPOTrainer(env=RLlibEnvWrapper, config=trainer_config,
-                         logger_creator=custom_log_creator(save_dir,'test'))
-                         # logger_creator=custom_log_creator(exp_dir,'test'))
-    return trainer,save_dir
+def load_run_configuration(cfg_path: str, phase: int, adj: str) -> tuple[dict, dict]:
+    config_path = os.path.join("./experiments", f"{cfg_path}.yaml")
+    with open(config_path, "r") as f:
+        run_configuration = yaml.safe_load(f)
 
-def train(trainer,args,save_dir):
-    NUM_ITERS = 400 if args.num_iter==-1 else args.num_iter
-    save_metric='a' if args.phase==1 else 'p'
-    metric_log=[]
-    cur_best=0
-    import time
-    pst_time=time.time()
+    if adj:
+        run_configuration["env"]["adjustemt_type"] = adj
+
+    run_configuration["general"]["train_planner"] = phase == 2
+
+    trainer_config = run_configuration.get("trainer", {})
+    env_config = {
+        "env_config_dict": run_configuration.get("env"),
+        "num_envs_per_worker": trainer_config.get("num_envs_per_worker", 1),
+    }
+    return run_configuration, env_config
+
+
+def train(trainer, num_iters: int, save_dir: str, save_metric: str):
+    os.makedirs(save_dir, exist_ok=True)
     trainer.save(save_dir)
-    for iteration in range(NUM_ITERS):
-        print(f'********** Iter : {iteration} **********')
+    metric_log = []
+    best_metric = -np.inf
+    start_time = time.time()
+
+    for iteration in range(num_iters):
+        print(f"********** Iter : {iteration} **********")
         result = trainer.train()
-        # import ipdb;ipdb.set_trace()
-        #r1 = trainer.workers.local_worker().sampler.get_data().policy_batches
-        #print(r1['a']['rewards'].sum(), result['episode_reward_mean'])
+        current_time = time.time()
 
-        cur_time = time.time()
+        policy_rewards = result.get("policy_reward_mean", {})
+        if save_metric in policy_rewards:
+            metric_value = policy_rewards[save_metric]
+            if metric_value > best_metric:
+                best_metric = metric_value
+                trainer.save(os.path.join(save_dir, f"rew_{metric_value:.4f}"))
 
-        if save_metric in result['policy_reward_mean'].keys():
-            if result['policy_reward_mean'][save_metric]>cur_best:
-                cur_best=result['policy_reward_mean'][save_metric]
-                trainer.save(f"{save_dir}/rew_{round(cur_best,4)}")
-            iter_time=round(cur_time-pst_time,4)
-            episode_reward_mean=round(result.get('episode_reward_mean'),6)
-            a_rew=round(result['policy_reward_mean']['a'],6)
-            p_rew=round(result['policy_reward_mean']['p'],6)
+            iter_time = round(current_time - start_time, 4)
+            episode_reward_mean = round(result.get("episode_reward_mean", 0.0), 6)
+            a_rew = round(policy_rewards.get("a", 0.0), 6)
+            p_rew = round(policy_rewards.get("p", 0.0), 6)
 
-            if 'profit_mean' in result['custom_metrics'].keys():
-                profit=round(result['custom_metrics']['profit_mean'],6)
-                equality=round(result['custom_metrics']['equality_mean'],6)
-                capability=round(result['custom_metrics']['capability_mean'],6)
-                equxcap=round(result['custom_metrics']['equXcap_mean'],6)
-                print(f"time: {iter_time} epi_rew: {episode_reward_mean} a_rew:{a_rew} ",
-                      f" p_rew:{p_rew}, epi_len: {result['episode_len_mean'] }",
-                      f" pro:{profit} equ:{equality} cap:{capability} ,prod:{equxcap}")
-                metric={'iter':iteration,'epi_len':result['episode_len_mean'],
-                        'epi_rew':episode_reward_mean,
-                        'a_rew':a_rew,'p_rew':p_rew,
-                        'profit':profit,'equlity':equality,
-                        'capability':capability,'equXcap':equxcap
-                        }
-                metric_log.append(metric)
-            pst_time=cur_time
+            custom_metrics = result.get("custom_metrics", {})
+            profit = round(custom_metrics.get("profit_mean", 0.0), 6)
+            equality = round(custom_metrics.get("equality_mean", 0.0), 6)
+            capability = round(custom_metrics.get("capability_mean", 0.0), 6)
+            equxcap = round(custom_metrics.get("equXcap_mean", 0.0), 6)
+
+            print(
+                "time: {} epi_rew: {} a_rew: {} p_rew: {} epi_len: {} pro: {} equ: {} cap: {} prod: {}".format(
+                    iter_time,
+                    episode_reward_mean,
+                    a_rew,
+                    p_rew,
+                    result.get("episode_len_mean", 0.0),
+                    profit,
+                    equality,
+                    capability,
+                    equxcap,
+                )
+            )
+
+            metric_log.append(
+                {
+                    "iter": iteration,
+                    "epi_len": result.get("episode_len_mean", 0.0),
+                    "epi_rew": episode_reward_mean,
+                    "a_rew": a_rew,
+                    "p_rew": p_rew,
+                    "profit": profit,
+                    "equlity": equality,
+                    "capability": capability,
+                    "equXcap": equxcap,
+                }
+            )
+            start_time = current_time
         else:
-            print(f"episode_reward_mean: {result.get('episode_reward_mean')}")
-        if iteration  % 10 == 9:
-            trainer.save(f"{save_dir}/iter_{iteration}")
-            print(f"save ckpt at iter {iteration}")
-    np.save(os.path.join(save_dir,'metric.npy'),metric_log)
+            print(f"episode_reward_mean: {result.get('episode_reward_mean', 0.0)}")
 
-if __name__=="__main__":
-    args=parse_args()
-    trainer,save_dir=init_trainer(args)
-    if args.restore!='':
-        trainer._restore(args.restore)
-        # trainer._restore('dir_ckpt_random-asy/iter_399/checkpoint_400/checkpoint-400')
-    train(trainer,args,save_dir)
+        if iteration % 10 == 9:
+            trainer.save(os.path.join(save_dir, f"iter_{iteration}"))
+            print(f"save ckpt at iter {iteration}")
+
+    np.save(os.path.join(save_dir, "metric.npy"), metric_log)
+
+
+def main():
+    args = parse_args()
+    run_configuration, env_config = load_run_configuration(args.cfg, args.phase, args.adj)
+
+    ray.init(ignore_reinit_error=True)
+
+    save_dir = os.path.join(
+        "runs",
+        f"phase_{args.phase}_{run_configuration['env']['adjustemt_type']}_seed_{args.seed}",
+        args.cfg[:12],
+    )
+
+    logger_creator = custom_log_creator(save_dir, "train")
+
+    trainer = build_trainer(
+        run_configuration, env_config, args.seed, logger_creator=logger_creator
+    )
+
+    if args.restore:
+        trainer.restore(args.restore)
+
+    num_iters = 400 if args.num_iter == -1 else args.num_iter
+    save_metric = "a" if args.phase == 1 else "p"
+    train(trainer, num_iters, save_dir, save_metric)
+
+
+if __name__ == "__main__":
+    main()
